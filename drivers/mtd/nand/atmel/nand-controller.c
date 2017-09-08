@@ -247,6 +247,7 @@ struct atmel_hsmc_nand_controller {
 		void __iomem *virt;
 		dma_addr_t dma;
 	} sram;
+	const struct atmel_hsmc_reg_layout *hsmc_layout;
 	struct regmap *io;
 	struct atmel_nfc_op op;
 	struct completion complete;
@@ -1201,7 +1202,7 @@ static int atmel_smc_nand_prepare_smcconf(struct atmel_nand *nand,
 	 * tRC < 30ns implies EDO mode. This controller does not support this
 	 * mode.
 	 */
-	if (conf->timings.sdr.tRC_min < 30)
+	if (conf->timings.sdr.tRC_min < 30000)
 		return -ENOTSUPP;
 
 	atmel_smc_cs_conf_init(smcconf);
@@ -1364,7 +1365,18 @@ static int atmel_smc_nand_prepare_smcconf(struct atmel_nand *nand,
 	ret = atmel_smc_cs_conf_set_timing(smcconf,
 					   ATMEL_HSMC_TIMINGS_TADL_SHIFT,
 					   ncycles);
-	if (ret)
+	/*
+	 * Version 4 of the ONFI spec mandates that tADL be at least 400
+	 * nanoseconds, but, depending on the master clock rate, 400 ns may not
+	 * fit in the tADL field of the SMC reg. We need to relax the check and
+	 * accept the -ERANGE return code.
+	 *
+	 * Note that previous versions of the ONFI spec had a lower tADL_min
+	 * (100 or 200 ns). It's not clear why this timing constraint got
+	 * increased but it seems most NANDs are fine with values lower than
+	 * 400ns, so we should be safe.
+	 */
+	if (ret && ret != -ERANGE)
 		return ret;
 
 	ncycles = DIV_ROUND_UP(conf->timings.sdr.tAR_min, mckperiodps);
@@ -1431,12 +1443,12 @@ static int atmel_hsmc_nand_setup_data_interface(struct atmel_nand *nand,
 					int csline,
 					const struct nand_data_interface *conf)
 {
-	struct atmel_nand_controller *nc;
+	struct atmel_hsmc_nand_controller *nc;
 	struct atmel_smc_cs_conf smcconf;
 	struct atmel_nand_cs *cs;
 	int ret;
 
-	nc = to_nand_controller(nand->base.controller);
+	nc = to_hsmc_nand_controller(nand->base.controller);
 
 	ret = atmel_smc_nand_prepare_smcconf(nand, conf, &smcconf);
 	if (ret)
@@ -1451,7 +1463,8 @@ static int atmel_hsmc_nand_setup_data_interface(struct atmel_nand *nand,
 	if (cs->rb.type == ATMEL_NAND_NATIVE_RB)
 		cs->smcconf.timings |= ATMEL_HSMC_TIMINGS_RBNSEL(cs->rb.id);
 
-	atmel_hsmc_cs_conf_apply(nc->smc, cs->id, &cs->smcconf);
+	atmel_hsmc_cs_conf_apply(nc->base.smc, nc->hsmc_layout, cs->id,
+				 &cs->smcconf);
 
 	return 0;
 }
@@ -2165,6 +2178,8 @@ atmel_hsmc_nand_controller_init(struct atmel_hsmc_nand_controller *nc)
 		dev_err(dev, "Missing or invalid atmel,smc property\n");
 		return -EINVAL;
 	}
+
+	nc->hsmc_layout = atmel_hsmc_get_reg_layout(np);
 
 	nc->irq = of_irq_get(np, 0);
 	of_node_put(np);

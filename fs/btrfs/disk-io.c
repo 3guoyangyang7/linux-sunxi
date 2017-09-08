@@ -3499,7 +3499,7 @@ static void write_dev_flush(struct btrfs_device *device)
 
 	bio_reset(bio);
 	bio->bi_end_io = btrfs_end_empty_barrier;
-	bio->bi_bdev = device->bdev;
+	bio_set_dev(bio, device->bdev);
 	bio->bi_opf = REQ_OP_WRITE | REQ_SYNC | REQ_PREFLUSH;
 	init_completion(&device->flush_wait);
 	bio->bi_private = &device->flush_wait;
@@ -3516,7 +3516,7 @@ static blk_status_t wait_dev_flush(struct btrfs_device *device)
 	struct bio *bio = device->flush_bio;
 
 	if (!device->flush_bio_sent)
-		return 0;
+		return BLK_STS_OK;
 
 	device->flush_bio_sent = 0;
 	wait_for_completion_io(&device->flush_wait);
@@ -3563,7 +3563,7 @@ static int barrier_all_devices(struct btrfs_fs_info *info)
 			continue;
 
 		write_dev_flush(dev);
-		dev->last_flush_error = 0;
+		dev->last_flush_error = BLK_STS_OK;
 	}
 
 	/* wait for all the barriers */

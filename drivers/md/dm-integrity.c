@@ -250,7 +250,8 @@ struct dm_integrity_io {
 
 	struct completion *completion;
 
-	struct block_device *orig_bi_bdev;
+	struct gendisk *orig_bi_disk;
+	u8 orig_bi_partno;
 	bio_end_io_t *orig_bi_end_io;
 	struct bio_integrity_payload *orig_bi_integrity;
 	struct bvec_iter orig_bi_iter;
@@ -1164,7 +1165,8 @@ static void integrity_end_io(struct bio *bio)
 	struct dm_integrity_io *dio = dm_per_bio_data(bio, sizeof(struct dm_integrity_io));
 
 	bio->bi_iter = dio->orig_bi_iter;
-	bio->bi_bdev = dio->orig_bi_bdev;
+	bio->bi_disk = dio->orig_bi_disk;
+	bio->bi_partno = dio->orig_bi_partno;
 	if (dio->orig_bi_integrity) {
 		bio->bi_integrity = dio->orig_bi_integrity;
 		bio->bi_opf |= REQ_INTEGRITY;
@@ -1587,16 +1589,18 @@ retry:
 	if (likely(ic->mode == 'J')) {
 		if (dio->write) {
 			unsigned next_entry, i, pos;
-			unsigned ws, we;
+			unsigned ws, we, range_sectors;
 
-			dio->range.n_sectors = min(dio->range.n_sectors, ic->free_sectors);
+			dio->range.n_sectors = min(dio->range.n_sectors,
+						   ic->free_sectors << ic->sb->log2_sectors_per_block);
 			if (unlikely(!dio->range.n_sectors))
 				goto sleep;
-			ic->free_sectors -= dio->range.n_sectors;
+			range_sectors = dio->range.n_sectors >> ic->sb->log2_sectors_per_block;
+			ic->free_sectors -= range_sectors;
 			journal_section = ic->free_section;
 			journal_entry = ic->free_section_entry;
 
-			next_entry = ic->free_section_entry + dio->range.n_sectors;
+			next_entry = ic->free_section_entry + range_sectors;
 			ic->free_section_entry = next_entry % ic->journal_section_entries;
 			ic->free_section += next_entry / ic->journal_section_entries;
 			ic->n_uncommitted_sections += next_entry / ic->journal_section_entries;
@@ -1679,8 +1683,9 @@ sleep:
 
 	dio->orig_bi_iter = bio->bi_iter;
 
-	dio->orig_bi_bdev = bio->bi_bdev;
-	bio->bi_bdev = ic->dev->bdev;
+	dio->orig_bi_disk = bio->bi_disk;
+	dio->orig_bi_partno = bio->bi_partno;
+	bio_set_dev(bio, ic->dev->bdev);
 
 	dio->orig_bi_integrity = bio_integrity(bio);
 	bio->bi_integrity = NULL;
@@ -1727,6 +1732,8 @@ static void pad_uncommitted(struct dm_integrity_c *ic)
 		wraparound_section(ic, &ic->free_section);
 		ic->n_uncommitted_sections++;
 	}
+	WARN_ON(ic->journal_sections * ic->journal_section_entries !=
+		(ic->n_uncommitted_sections + ic->n_committed_sections) * ic->journal_section_entries + ic->free_sectors);
 }
 
 static void integrity_commit(struct work_struct *w)
@@ -1821,6 +1828,9 @@ static void do_journal_write(struct dm_integrity_c *ic, unsigned write_start,
 {
 	unsigned i, j, n;
 	struct journal_completion comp;
+	struct blk_plug plug;
+
+	blk_start_plug(&plug);
 
 	comp.ic = ic;
 	comp.in_flight = (atomic_t)ATOMIC_INIT(1);
@@ -1944,6 +1954,8 @@ skip_io:
 	}
 
 	dm_bufio_write_dirty_buffers_async(ic->bufio);
+
+	blk_finish_plug(&plug);
 
 	complete_journal_op(&comp);
 	wait_for_completion_io(&comp.comp);
@@ -3017,6 +3029,11 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	if (ic->sb->log2_sectors_per_block != __ffs(ic->sectors_per_block)) {
 		r = -EINVAL;
 		ti->error = "Block size doesn't match the information in superblock";
+		goto bad;
+	}
+	if (!le32_to_cpu(ic->sb->journal_sections)) {
+		r = -EINVAL;
+		ti->error = "Corrupted superblock, journal_sections is 0";
 		goto bad;
 	}
 	/* make sure that ti->max_io_len doesn't overflow */

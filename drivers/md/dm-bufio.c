@@ -616,7 +616,7 @@ static void use_inline_bio(struct dm_buffer *b, int rw, sector_t sector,
 
 	bio_init(&b->bio, b->bio_vec, DM_BUFIO_INLINE_VECS);
 	b->bio.bi_iter.bi_sector = sector;
-	b->bio.bi_bdev = b->c->bdev;
+	bio_set_dev(&b->bio, b->c->bdev);
 	b->bio.bi_end_io = inline_endio;
 	/*
 	 * Use of .bi_private isn't a problem here because
@@ -1258,8 +1258,7 @@ EXPORT_SYMBOL_GPL(dm_bufio_write_dirty_buffers_async);
  */
 int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
 {
-	blk_status_t a;
-	int f;
+	int a, f;
 	unsigned long buffers_processed = 0;
 	struct dm_buffer *b, *tmp;
 
